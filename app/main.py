@@ -1,7 +1,9 @@
-"""FastAPI 历史查询网页：源目录成组修改、提交点查询、捕获进度。
+"""FastAPI 历史查询网页：源目录成组修改、提交点查询、捕获进度、重建捕获。
 
-初始化未完成（phase != STREAMING）时，所有历史查询接口返回 503，
-不对外开放尚未完整的历史；源目录修改走源库自身事务，不受此限制。
+首次基线未完成（不存在任何已完成世代）时，所有历史查询接口返回 503，
+不开放尚未完整的历史；一旦有世代落盘，即使复制槽缺失（ERROR）或正在
+重建（REBUILDING），旧段历史仍可正常回看。源目录修改走源库自身事务，
+不受捕获状态限制。
 """
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from .capture import CaptureWorker
+from .capture import CaptureWorker, RebuildError
 from .config import settings
 from .source import SourceDB, SourceError
 from .storage import HistoryStore, lsn_to_num
@@ -137,6 +139,26 @@ def api_batch_write(req: BatchRequest) -> dict:
     return result
 
 
+# -------------------------------------------------------------- 重建捕获
+@app.post("/api/capture/rebuild")
+def api_rebuild_capture() -> dict:
+    """复制槽被人工删除后的“重建捕获”。
+
+    保留全部旧提交点与目录历史：确认旧槽缺失后，在新世代对当前源目录
+    建立新的一致基线并接续逻辑复制；两段历史之间的未覆盖区间在提交点
+    列表中以 GAP 显式分开。重建期间普通 SQL 可继续提交。
+    """
+    try:
+        generation = worker.request_rebuild()
+    except RebuildError as exc:
+        # 槽仍存在 / 重建进行中 / 尚无基线：属于前置条件不满足
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "message": "重建捕获已开始：保留旧历史，新基线写入新世代",
+        "pending_generation": generation,
+    }
+
+
 # ---------------------------------------------------------------- 历史查询
 @app.get("/api/points")
 def api_points() -> dict:
@@ -144,17 +166,40 @@ def api_points() -> dict:
     return {"points": store.get_points()}
 
 
+@app.get("/api/generations")
+def api_generations() -> dict:
+    """各捕获世代及相邻世代之间的未覆盖区间（断档）。"""
+    _require_ready()
+    return {"generations": store.get_generations()}
+
+
 @app.get("/api/directory")
 def api_directory(point: str) -> JSONResponse:
-    """按提交点（LSN，如 0/16B3748）查看该时刻的整张目录。"""
+    """按提交点（LSN，如 0/16B3748）查看该时刻的整张目录。
+
+    提交点按世代隔离：旧点只按旧段回看，新世代的点不会混入断档前的
+    残留值。GAP（未覆盖区间）不是可回看的提交点。
+    """
     _require_ready()
     try:
         lsn_num = lsn_to_num(point)
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="point 必须是 LSN，形如 0/16B3748")
     points = store.get_points()
-    valid_nums = {p["lsn_num"] for p in points}
-    if lsn_num not in valid_nums:
+    match = next(
+        (p for p in points if p["kind"] != "GAP" and p["lsn_num"] == lsn_num),
+        None,
+    )
+    if match is None:
+        gap = next((p for p in points if p["kind"] == "GAP"), None)
+        if gap is not None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "该 LSN 落在复制槽删除造成的未覆盖区间(GAP)内，"
+                    "无法回看；请选择 GAP 之前的旧世代提交点或之后的新基线点"
+                ),
+            )
         raise HTTPException(
             status_code=404,
             detail="该 LSN 不是已捕获的提交点，请先在 /api/points 中选择",
@@ -163,7 +208,8 @@ def api_directory(point: str) -> JSONResponse:
         {
             "point": point,
             "point_lsn_num": lsn_num,
-            "artifacts": store.get_directory_at(lsn_num),
+            "generation": match["generation"],
+            "artifacts": store.get_directory_at(lsn_num, match["generation"]),
         }
     )
 

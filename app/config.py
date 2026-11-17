@@ -27,6 +27,12 @@ class Settings:
     inflight_hook_no: int = int(_env("TEST_INFLIGHT_ARTIFACT_NO", "0"))
     inflight_hook_sleep_s: float = float(_env("TEST_INFLIGHT_SLEEP_S", "3"))
 
+    # 测试钩子：重建基线已 SQLite 落盘、但 mark_streaming 之前的等待毫秒数，
+    # 用于确定性地构造“落盘后、收尾前崩溃”，验证重启只收尾、不产生重复世代。
+    rebuild_sleep_after_baseline_ms: int = int(
+        _env("TEST_REBUILD_SLEEP_AFTER_BASELINE_MS", "0")
+    )
+
     # ---- 本地历史库 SQLite ----
     sqlite_path: str = _env("SQLITE_PATH", "/tmp/capture/history.db")
 

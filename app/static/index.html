@@ -29,15 +29,19 @@
   .badge.STREAMING { background:#dafbe1; color:var(--ok); }
   .badge.INITIALIZING { background:#fff8c5; color:var(--warn); }
   .badge.ERROR { background:#ffebe9; color:var(--err); }
+  .badge.REBUILDING { background:#ddf4ff; color:#0969da; }
   .muted { color:#656d76; font-size:12px; }
   .msg { margin-top:8px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
   .point-row { cursor:pointer; }
   .point-row:hover { background:var(--bg); }
+  tr.gap-row { background:#fff8c5; cursor:default; }
+  tr.gap-row:hover { background:#fff8c5; }
   .tag { font-size:11px; padding:1px 6px; border-radius:4px; background:var(--bg); border:1px solid var(--bd); }
   .tag.DELETE { color:var(--err); border-color:var(--err); }
   .tag.INSERT, .tag.BASELINE { color:var(--ok); border-color:var(--ok); }
   .tag.UPDATE { color:#0969da; border-color:#0969da; }
+  .tag.GAP { color:var(--warn); border-color:var(--warn); font-weight:700; }
 </style>
 </head>
 <body>
@@ -52,7 +56,18 @@
   </section>
 
   <section class="card">
-    <h2>② 成组修改源目录（同一源事务提交）</h2>
+    <h2>② 重建捕获（复制槽被删除后接续）</h2>
+    <div class="muted" style="margin-bottom:8px;">
+      前置条件：源库上的旧复制槽已确认缺失。触发后保留全部旧提交点与目录历史，
+      对当前源目录建立新的一致基线并接续逻辑复制；两段历史与中间未覆盖区间
+      （GAP）分开显示，重建期间普通 SQL 可继续提交，跨新基线的事务只出现一次。
+    </div>
+    <button class="danger" onclick="rebuildCapture()">重建捕获（确认旧槽已缺失）</button>
+    <div class="msg" id="rebuild-msg"></div>
+  </section>
+
+  <section class="card full">
+    <h2>③ 成组修改源目录（同一源事务提交）</h2>
     <div id="ops"></div>
     <div style="display:flex; gap:8px;">
       <button onclick="addOp('insert')">+ 新增</button>
@@ -65,16 +80,16 @@
   </section>
 
   <section class="card full">
-    <h2>③ 选择提交点查看旧值（点击一行 = 查看该点整目录）</h2>
+    <h2>④ 选择提交点查看旧值（点击一行 = 查看该点整目录；GAP 行不可回看）</h2>
     <table>
-      <thead><tr><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
-      <tbody id="points"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      <thead><tr><th>世代</th><th>类型</th><th>提交点 LSN</th><th>源事务 xid</th><th>提交时间</th><th>变更行数</th></tr></thead>
+      <tbody id="points"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
     </table>
     <div id="dir-wrap" style="margin-top:14px;"></div>
   </section>
 
   <section class="card full">
-    <h2>④ 单编号完整历史（含删除/重用）</h2>
+    <h2>⑤ 单编号完整历史（含删除/重用，按世代分段）</h2>
     <div style="display:flex; gap:8px; max-width:420px;">
       <input id="hist-no" type="number" min="1" placeholder="制品编号，如 1001">
       <button onclick="loadHistory()">查询</button>
@@ -101,16 +116,31 @@ async function getJSON(url, opts){
 async function refreshProgress(){
   try {
     const p = await getJSON('/api/progress');
+    const genLine = (p.generation_count ?? 0) > 0
+      ? `<div>捕获世代</div><div>共 ${p.generation_count} 段（当前第 ${p.current_generation} 段）${p.rebuild_pending_generation!=null ? '，待建第 '+p.rebuild_pending_generation+' 段' : ''}</div>` : '';
     document.getElementById('progress').innerHTML = `
       <div>状态</div><div><span class="badge ${esc(p.phase)}">${esc(p.phase)}</span></div>
       <div>复制槽</div><div><code>${esc(p.slot_name ?? '-')}</code></div>
-      <div>基线 LSN</div><div><code>${esc(p.baseline_lsn ?? '-')}</code></div>
+      <div>当前基线 LSN</div><div><code>${esc(p.baseline_lsn ?? '-')}</code></div>
       <div>最近提交点</div><div><code>${esc(p.last_commit_lsn ?? '-')}</code></div>
       <div>最近流消息 LSN</div><div><code>${esc(p.last_message_lsn ?? '-')}</code></div>
+      ${genLine}
       <div>已捕获事务数</div><div>${p.captured_transactions ?? 0}</div>
       <div>历史日志行数</div><div>${p.history_rows ?? 0}</div>
       <div>最近错误</div><div>${p.last_error ? '<span style="color:var(--err)">'+esc(p.last_error)+'</span>' : '无'}</div>`;
   } catch(e){ document.getElementById('progress').innerHTML = '<div class="msg err">'+esc(e.message)+'</div>'; }
+}
+
+// ------------------------------------------------------------- 重建捕获
+async function rebuildCapture(){
+  if (!window.confirm('确认源库上的旧复制槽已被删除？\n\n重建将保留全部旧历史，对当前源目录建立新基线，两段历史之间的未覆盖区间会标记为 GAP。')) return;
+  try {
+    const r = await getJSON('/api/capture/rebuild', {method:'POST'});
+    setMsg('rebuild-msg', r.message + '（新世代号 '+r.pending_generation+'）', 'ok');
+  } catch(e){
+    setMsg('rebuild-msg', '重建未启动：'+ (e.body?.detail || e.message), 'err');
+  }
+  refreshProgress(); refreshPoints();
 }
 
 // ------------------------------------------------------------- 成组修改
@@ -168,17 +198,26 @@ async function refreshPoints(){
   try {
     const r = await getJSON('/api/points');
     pointsCache = r.points;
-    if (!r.points.length) { tb.innerHTML='<tr><td colspan="5" class="muted">暂无提交点</td></tr>'; return; }
-    tb.innerHTML = r.points.map(p => `
+    if (!r.points.length) { tb.innerHTML='<tr><td colspan="6" class="muted">暂无提交点</td></tr>'; return; }
+    tb.innerHTML = r.points.map(p => {
+      if (p.kind === 'GAP') {
+        return `<tr class="gap-row" title="未覆盖区间，不可回看">
+          <td>${esc(p.generation)}</td>
+          <td><span class="tag GAP">GAP</span></td>
+          <td class="muted" colspan="4">未覆盖区间：旧段 <code>${esc(p.gap_from_lsn ?? '基线')}</code>（不含） → 新基线 <code>${esc(p.gap_to_lsn ?? '-')}</code>（不含），此区间源变更无法追查</td></tr>`;
+      }
+      return `
       <tr class="point-row" onclick="viewDirectory('${esc(p.lsn)}')">
+        <td>${esc(p.generation)}</td>
         <td><span class="tag ${p.kind}">${esc(p.kind)}</span></td>
         <td><code>${esc(p.lsn)}</code></td>
         <td>${p.xid ?? '—'}</td>
         <td>${esc(p.commit_ts ?? '—')}</td>
         <td>${p.change_count}</td>
-      </tr>`).join('');
+      </tr>`;
+    }).join('');
   } catch(e){
-    tb.innerHTML = `<tr><td colspan="5" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
+    tb.innerHTML = `<tr><td colspan="6" class="msg err">${esc(e.status===503 ? '初始化未完成，历史暂不开放' : e.message)}</td></tr>`;
   }
 }
 
@@ -186,7 +225,7 @@ async function viewDirectory(lsn){
   const r = await getJSON('/api/directory?point='+encodeURIComponent(lsn));
   const rows = r.artifacts;
   document.getElementById('dir-wrap').innerHTML = `
-    <h3 style="font-size:14px;margin:6px 0;">提交点 <code>${esc(lsn)}</code> 的整张目录（${rows.length} 行）</h3>
+    <h3 style="font-size:14px;margin:6px 0;">世代 ${esc(r.generation)} 提交点 <code>${esc(lsn)}</code> 的整张目录（${rows.length} 行，仅按该世代回看）</h3>
     <table><thead><tr><th>制品编号</th><th>服务名</th><th>版本</th><th>SHA-256</th><th>来源</th></tr></thead>
     <tbody>${rows.map(a=>`<tr><td>${a.artifact_no}</td><td>${esc(a.service_name)}</td>
       <td>${esc(a.version)}</td><td><code>${esc(a.sha256)}</code></td>
@@ -202,9 +241,9 @@ async function loadHistory(){
   try {
     const r = await getJSON('/api/history/'+no);
     if (!r.history.length) { wrap.innerHTML='<div class="muted">该编号没有任何历史记录</div>'; return; }
-    wrap.innerHTML = `<table><thead><tr><th>顺序</th><th>变更</th><th>服务名</th><th>版本</th><th>SHA-256</th>
+    wrap.innerHTML = `<table><thead><tr><th>世代</th><th>顺序</th><th>变更</th><th>服务名</th><th>版本</th><th>SHA-256</th>
       <th>xid</th><th>提交点 LSN</th><th>捕获时间</th></tr></thead><tbody>
-      ${r.history.map((h,i)=>`<tr><td>${i+1}</td><td><span class="tag ${esc(h.change_type)}">${esc(h.change_type)}</span></td>
+      ${r.history.map((h,i)=>`<tr><td>${esc(h.generation)}</td><td>${i+1}</td><td><span class="tag ${esc(h.change_type)}">${esc(h.change_type)}</span></td>
         <td>${esc(h.service_name ?? '—')}</td><td>${esc(h.version ?? '—')}</td>
         <td><code>${esc(h.sha256 ?? '—')}</code></td><td>${h.xid ?? '—'}</td>
         <td><code>${esc(h.commit_lsn ?? '—')}</code></td><td class="muted">${esc(h.captured_at)}</td></tr>`).join('')}
