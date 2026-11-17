@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+data/
+.venv/
+venv/
+.DS_Store
+# 历史上测试脚本参数 bug 可能产生的数字命名目录
+[0-9]*/
